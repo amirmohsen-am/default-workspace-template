@@ -42,13 +42,14 @@ Cloud / litellm proxy (``ANTHROPIC_BASE_URL``) path is intentionally unsupported
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import queue
 import shutil
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any, Literal
 
@@ -70,6 +71,7 @@ from pydantic import PrivateAttr
 from browser import manifest as fleet_manifest
 from browser.names import generate_browser_name, is_valid_browser_name
 from browser.oom_retag import notify_chromium_processes_expected
+from browser.vnc import VncDisplay, VncStartupError
 
 # browser-use phones home anonymized telemetry by default; disable it (the
 # compute has no business making that call, and it spams connection-error logs
@@ -455,6 +457,9 @@ class LiveBrowser(MutableModel):
     # the last `state`'s numbered elements (so `click <index>` resolves a node), and
     # the sticky-lease activity timestamp the idle-TTL sweep checks.
     _action_handler: ActionHandler | None = PrivateAttr(default=None)
+    # This browser's private KasmVNC display (its X server + live-view client).
+    # None before start() and after close().
+    _vnc: VncDisplay | None = PrivateAttr(default=None)
     _selector_map: dict[int, Any] = PrivateAttr(default_factory=dict)
     _lease_touched_at: float = PrivateAttr(default=0.0)
     _screenshot_seq: int = PrivateAttr(default=0)
@@ -509,13 +514,59 @@ class LiveBrowser(MutableModel):
         browser can be driven and the viewer shows the live page."""
         return self._lifecycle == "running"
 
+    def _start_vnc(self) -> None:
+        """Bring up this browser's private KasmVNC display (see browser.vnc).
+
+        REQUIRED, not best-effort: a browser IS its VNC display. Chromium is launched
+        headful and renders into this X server, so without it there is nothing to run
+        and nothing to show. A failure here fails the launch, loudly -- the fleet has
+        exactly one live-view path and no degraded mode to fall back into.
+        """
+        display = VncDisplay(self.browser_id)
+        try:
+            display.start()
+        except VncStartupError:
+            display.release()
+            raise
+        self._vnc = display
+
+    def _stop_vnc(self) -> None:
+        """Tear the display down. Idempotent; safe on a browser that never started one."""
+        display = self._vnc
+        self._vnc = None
+        if display is not None:
+            display.stop()
+
+    @contextlib.contextmanager
+    def _display_env(self) -> "Iterator[None]":
+        """Scope ``DISPLAY`` to this browser's X server for the duration of a launch.
+
+        Chromium reads DISPLAY from its environment at exec, and browser-use gives us
+        no hook to pass a per-launch env, so we mutate the process env around the
+        launch and restore it. Safe because the manager's ``_startup_lock`` serializes
+        launches (at most one at a time) and the daemon runs one event loop -- so no
+        other launch can observe the mutated value.
+        """
+        previous = os.environ.get("DISPLAY")
+        if self._vnc is not None:
+            os.environ["DISPLAY"] = self._vnc.display
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop("DISPLAY", None)
+            else:
+                os.environ["DISPLAY"] = previous
+
     def _build_bu_session(self, profile_dir: Path, chromium_path: str, *, chromium_sandbox: bool) -> BrowserSession:
         """Construct (don't start) the browser-use session for this browser's persistent
         profile. ``chromium_sandbox`` is False when Chromium's in-process sandbox must be
         disabled (see _NO_SANDBOX / the start() fallback); browser-use then injects
         ``--no-sandbox`` itself."""
         return BrowserSession(
-            headless=_HEADLESS,
+            # Always headful: the live view IS this browser's X framebuffer, so a
+            # headless Chromium would render nothing into it.
+            headless=False,
             executable_path=chromium_path,
             # Persistent profile on the workspace volume -- the whole point of
             # persistence. The dir name (see _profile_dir) is load-bearing for
@@ -541,6 +592,13 @@ class LiveBrowser(MutableModel):
         once with the sandbox off (the only thing the retry changes), covering any non-root
         runtime that also can't sandbox."""
         disable_sandbox = _should_disable_sandbox()
+        with self._display_env():
+            return await self._start_bu_session_locked(profile_dir, chromium_path, disable_sandbox)
+
+    async def _start_bu_session_locked(
+        self, profile_dir: Path, chromium_path: str, disable_sandbox: bool
+    ) -> BrowserSession:
+        """The launch itself, run with ``DISPLAY`` already scoped to this browser."""
         session = self._build_bu_session(profile_dir, chromium_path, chromium_sandbox=not disable_sandbox)
         try:
             await session.start()
@@ -575,6 +633,9 @@ class LiveBrowser(MutableModel):
         profile_dir = _profile_dir(self.browser_id)
         profile_dir.mkdir(parents=True, exist_ok=True)
         _clear_stale_singleton(profile_dir)  # a prior hard kill may have orphaned a lock
+        # This browser's own X server + live-view client. Started BEFORE Chromium, which
+        # is launched headful against it.
+        self._start_vnc()
         self._bu_session = await self._start_bu_session(profile_dir, chromium_path)
         # The Chromium tree just spawned (and its processes self-write their
         # oom_score_adj moments later): have the OOM sweep re-band it.
@@ -633,6 +694,10 @@ class LiveBrowser(MutableModel):
                 await bu_session.kill()
             except _BROWSER_ERRORS as e:
                 logger.debug("aborted-launch kill ignored ({})", e)
+        # Reap the display too, or an aborted launch leaks an Xvnc (and its display
+        # number) for the life of the container -- close() never runs for a browser
+        # that was already popped from the registry.
+        self._stop_vnc()
         return True
 
     async def _open_initial_tabs(
@@ -719,17 +784,9 @@ class LiveBrowser(MutableModel):
                     )
                 except _BROWSER_ERRORS as e:
                     logger.debug("device-metrics override ignored ({})", e)
-                cdp.on("Page.screencastFrame", self._on_screencast_frame)
-                await cdp.send(
-                    "Page.startScreencast",
-                    {
-                        "format": _SCREENCAST_FORMAT,
-                        "quality": _SCREENCAST_QUALITY,
-                        "maxWidth": _SCREENCAST_MAX_WIDTH,
-                        "maxHeight": _SCREENCAST_MAX_HEIGHT,
-                        "everyNthFrame": _SCREENCAST_EVERY_NTH_FRAME,
-                    },
-                )
+                # No CDP screencast: pixels come from this browser's VNC display.
+                # The CDP session itself stays -- the fleet still uses it for device
+                # metrics, tab tracking and agent actions -- but nothing streams frames.
             except _BROWSER_ERRORS as e:
                 logger.debug("screencast attach ignored ({})", e)
                 return
@@ -1922,6 +1979,10 @@ class LiveBrowser(MutableModel):
                 await bu_session.kill()
             except _BROWSER_ERRORS as e:
                 logger.debug("browser kill ignored ({})", e)
+        # The display goes LAST: Chromium must be gone before the X server it renders
+        # into, or it loses its connection mid-teardown and the observer reports a
+        # crash for a browser we are deliberately closing.
+        self._stop_vnc()
 
 
 async def _safe_title(page: Page) -> str:

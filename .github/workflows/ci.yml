@@ -67,6 +67,27 @@ jobs:
       - name: Install Playwright browsers
         run: uv run playwright install --with-deps chromium
 
+      # KasmVNC provides Xvnc, the X server every browser in the fleet renders into.
+      # The fleet is headful-only -- there is no headless mode to fall back to -- so
+      # the real-Chromium integration tests cannot launch a browser without this.
+      #
+      # The runner is Ubuntu, so this is the `noble` build; the workspace image is
+      # Debian trixie and pins its own copy in system/scripts/env.d/1010-kasmvnc.sh.
+      # Same upstream version (1.4.0) on both, so keep the two pins in step.
+      - name: Install KasmVNC (Xvnc)
+        run: |
+          set -euo pipefail
+          url="https://github.com/kasmtech/KasmVNC/releases/download/v1.4.0/kasmvncserver_noble_1.4.0_amd64.deb"
+          sha256="12bac6014149c5fdee75f0d403785aaa3e5dd4ea222de73253a5d4181bc9567e"
+          curl -fsSL -o /tmp/kasmvncserver.deb "$url"
+          echo "$sha256  /tmp/kasmvncserver.deb" | sha256sum --check --strict
+          # `apt-get install ./file.deb` (not `dpkg -i`) so the dependency tail --
+          # xkbcomp, xkb-data, xauth, libxfont2 -- resolves. Xvnc exits immediately
+          # at startup without xkbcomp, and a slim runner has no X fonts either.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends /tmp/kasmvncserver.deb xfonts-base
+          Xvnc -version
+
       - name: Build system/apps/system_interface frontend
         working-directory: system/apps/system_interface/frontend
         run: |

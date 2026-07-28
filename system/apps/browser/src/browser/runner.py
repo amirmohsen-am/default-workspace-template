@@ -35,16 +35,20 @@ FastAPI ``root_path`` it replaced only emitted prefix-aware URLs the page never
 relied on).
 """
 
+import contextlib
 import json
 import os
 import queue
 import signal
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import FrameType
 from typing import Any
 
+import simple_websocket
 from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
 from loguru import logger
@@ -99,6 +103,11 @@ _DIRECT_ACTION_TIMEOUT: float | None = _DIRECT_ACTION_TIMEOUT_RAW if _DIRECT_ACT
 _NDJSON_POLL_SECONDS = 0.5
 _CAST_OUTBOUND_POLL_SECONDS = 1.0
 _CAST_INBOUND_POLL_SECONDS = 0.05
+# VNC proxy: how long to wait on a static asset fetch from a browser's own Xvnc
+# httpd (loopback, small files), and the poll interval on each leg of the RFB
+# bridge. The poll exists so both directions can notice the stop flag promptly.
+_VNC_ASSET_TIMEOUT = 10.0
+_VNC_POLL_SECONDS = 0.05
 
 # The ONE sync<->async boundary: every route reaches the async world through this
 # bridge's single background loop (see browser.loop_bridge). The manager and all
@@ -774,6 +783,106 @@ def _cast_inbound_pump(
         stop_event.set()
 
 
+# --- KasmVNC proxy -----------------------------------------------------------
+#
+# Each browser owns a private Xvnc on 127.0.0.1 (see browser.vnc). Rather than
+# registering N workspace services -- one per browser, cluttering the "+" menu and
+# leaking the fleet's internal port allocation into the workspace's service list --
+# the daemon proxies them all under its OWN already-registered service:
+#
+#     /browsers/<id>/vnc/...          -> http://127.0.0.1:<that browser's port>/...
+#     /browsers/<id>/vnc/websockify   -> ws://127.0.0.1:<that browser's port>/websockify
+#
+# So ``service:browser?session=<name>`` keeps meaning exactly what it means today,
+# one auth path covers every browser, and a browser's port is never reachable from
+# outside this process.
+
+
+def _vnc_port(browser_id: str) -> int | None:
+    """The live Xvnc port for this browser, or None if it has no display yet."""
+    session = _resolve_sync_for_ws(browser_id)
+    if session is None:
+        return None
+    display = getattr(session, "_vnc", None)
+    return None if display is None else display.port
+
+
+def vnc_asset(browser_id: str, path: str) -> Response:
+    """Serve one file from this browser's KasmVNC client (its in-process httpd).
+
+    Static assets only -- the HTML client, its JS/CSS/images. Small files, so a
+    buffered stdlib fetch is enough and the app needs no HTTP-client dependency.
+    """
+    port = _vnc_port(browser_id)
+    if port is None:
+        return Response("browser has no live view", status=404, mimetype="text/plain")
+    query = request.query_string.decode()
+    target = f"http://127.0.0.1:{port}/{path}" + (f"?{query}" if query else "")
+    try:
+        with urllib.request.urlopen(target, timeout=_VNC_ASSET_TIMEOUT) as response:  # noqa: S310 - fixed loopback scheme
+            body = response.read()
+            content_type = response.headers.get("Content-Type", "application/octet-stream")
+    except urllib.error.HTTPError as e:
+        return Response(e.read(), status=e.code, mimetype=e.headers.get("Content-Type", "text/plain"))
+    except (urllib.error.URLError, OSError) as e:
+        logger.debug("vnc asset {} for browser {} failed ({})", path, browser_id, e)
+        return Response("live view unavailable", status=502, mimetype="text/plain")
+    return Response(body, status=200, mimetype=content_type)
+
+
+def _vnc_pump_to_client(ws: Any, backend: Any, stop_event: threading.Event) -> None:
+    """Backend -> client. Runs on its own thread so neither direction blocks the other
+    (the same split the cast socket uses; simple-websocket allows send and receive
+    from different threads)."""
+    try:
+        while not stop_event.is_set():
+            message = backend.receive(timeout=_VNC_POLL_SECONDS)
+            if message is None:
+                continue  # poll timeout; re-check the stop flag
+            ws.send(message)
+    except (ConnectionClosed, OSError):
+        pass
+    finally:
+        stop_event.set()
+
+
+def vnc_socket(ws: Any, browser_id: str) -> None:
+    """Bridge the viewer's RFB WebSocket to this browser's Xvnc.
+
+    Pure byte forwarding in both directions -- the daemon never parses RFB. This is
+    the whole human input path: pointer and keyboard events ride this socket and
+    Xvnc injects them as X events at the display level, which is why native context
+    menus, native ``<select>`` dropdowns and click-drag work without any input code
+    in this repo.
+    """
+    port = _vnc_port(browser_id)
+    if port is None:
+        ws.close(1013)  # no display yet -- the pane retries with backoff
+        return
+    stop_event = threading.Event()
+    backend: Any = None
+    try:
+        backend = simple_websocket.Client(f"ws://127.0.0.1:{port}/websockify", subprotocols=["binary"])
+    except (ConnectionClosed, OSError) as e:
+        logger.warning("could not reach the live view for browser {} ({})", browser_id, e)
+        ws.close(1011)
+        return
+    pump = threading.Thread(target=_vnc_pump_to_client, args=(ws, backend, stop_event), daemon=True)
+    pump.start()
+    try:
+        while not stop_event.is_set():
+            message = ws.receive(timeout=_VNC_POLL_SECONDS)
+            if message is None:
+                continue
+            backend.send(message)
+    except (ConnectionClosed, OSError):
+        pass
+    finally:
+        stop_event.set()
+        with contextlib.suppress(Exception):
+            backend.close()
+
+
 def cast_socket(ws: Any, browser_id: str) -> None:
     """Bridge one cast WebSocket: outbound screencast frames + inbound input/control.
 
@@ -876,6 +985,9 @@ def _register_routes() -> None:
     application.add_url_rule("/browsers/<string:browser_id>/keys", view_func=cmd_keys, methods=["POST"])
     application.add_url_rule("/browsers/<string:browser_id>/screenshot", view_func=cmd_screenshot, methods=["POST"])
     application.add_url_rule("/browsers/<string:browser_id>/tab", view_func=cmd_tab, methods=["POST"])
+    application.add_url_rule("/browsers/<string:browser_id>/vnc/", view_func=vnc_asset, defaults={"path": "vnc.html"})
+    application.add_url_rule("/browsers/<string:browser_id>/vnc/<path:path>", view_func=vnc_asset)
+    sock.route("/browsers/<string:browser_id>/vnc/websockify")(vnc_socket)
     sock.route("/browsers/<string:browser_id>/cast")(cast_socket)
 
 
